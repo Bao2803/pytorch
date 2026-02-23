@@ -515,17 +515,51 @@ def register_symm_mem_lowerings():
         group_name: str,  # type: ignore[arg-type]
     ) -> ir.TensorBox:
         """
-        Ensure inp is in P2P memory for a symm_mem collective.
+        Helper to realize an input as symmetric memory buffer if possible.
+
+        Three paths, in priority order:
+        1. We control allocation (ComputedBuffer, etc.): CommBufferLayout. Zero-copy.
+        2. Graph placeholder (InputBuffer, static shapes): mark layout.allocator =
+           SYMM_MEM; wrapper generates persistent P2P buffer + DMA .copy_().
+        3. Fallback: insert Pointwise identity copy in P2P via CommBufferLayout.
 
         Returns the (possibly replaced) TensorBox. Callers must use
         the return value since a new identity-copy buffer may be created.
-        # TODO: PR#5 adds a Layout-based path (Path 2) for InputBuffer.
         """
         if can_realize_as_comm_buffer(inp, ir.CommBufferType.SYMM_MEM):
             realize_as_comm_buffer(inp, ir.CommBufferType.SYMM_MEM, group_name)  # type: ignore[arg-type]
             return inp
-        else:
-            return _copy_input_to_comm_buffer(inp, ir.CommBufferType.SYMM_MEM, group_name)  # type: ignore[arg-type]
+
+        data = _get_data(inp)
+        if isinstance(data, ir.InputBuffer):
+            # Layout approach: mark allocator constraint on InputBuffer.
+            # The CG tree / wrapper will allocate P2P and copy at call time,
+            # avoiding an extra Triton identity kernel inside the graph.
+            #
+            # This requires static shapes because the persistent P2P buffer
+            # is allocated at module level (import time). If any dimension
+            # is symbolic, fall back to the identity copy (Path 3).
+            layout = data.get_output_spec()
+            assert isinstance(layout, ir.Layout)
+            has_symbolic = any(is_symbolic(s) for s in layout.size) or any(
+                is_symbolic(s) for s in layout.stride
+            )
+            if not has_symbolic:
+                data.layout = ir.FixedLayout(
+                    device=layout.device,
+                    dtype=layout.dtype,
+                    size=layout.size,
+                    stride=layout.stride,
+                    offset=layout.offset,
+                    allocator=ir.AllocatorType.SYMM_MEM,
+                )
+                # TODO(#138280): group_name is attached as an ad-hoc
+                # attribute. The long-term Layout refactor should make this
+                # a proper field (or embed it in AllocatorType).
+                data.layout.group_name = group_name  # type: ignore[attr-defined]
+                return inp
+
+        return _copy_input_to_comm_buffer(inp, ir.CommBufferType.SYMM_MEM, group_name)  # type: ignore[arg-type]
 
     def _create_out_variant_node(
         out_op: torch._ops.OpOverload,
