@@ -2841,6 +2841,13 @@ def constrain_to_fx_strides(fx_node, *args, **kwargs):
 def sdpa_constraint(fx_node, *args, **kwargs):
     # sdpa requires dense last dimension]
 
+    # Cache constrained results keyed by (arg identity, stride_order) to avoid
+    # creating duplicate buffers when the same tensor is used at multiple
+    # positions (e.g., key=value in simplified PMA attention).  Without this,
+    # require_strides mutates the shared TensorBox on the first call and then
+    # copy_input creates a second independent buffer on the second call.
+    _constraint_cache: dict[tuple[int, Optional[tuple[int, ...]]], ir.IRNode] = {}
+
     def apply_constraint(idx, arg, fx_arg):
         if not isinstance(arg, ir.IRNode):
             return arg
@@ -2868,6 +2875,18 @@ def sdpa_constraint(fx_node, *args, **kwargs):
             # Check https://github.com/pytorch/pytorch/issues/138772
             stride_order = (3, 1, 2, 0)
 
+        cache_key = (id(arg), tuple(stride_order) if stride_order else None)
+        if config.cache_sdpa_constraint and cache_key in _constraint_cache:
+            return _constraint_cache[cache_key]
+
+        result = _apply_constraint_inner(
+            idx, arg, meta_val, meta_stride_expr, stride_order
+        )
+        if config.cache_sdpa_constraint:
+            _constraint_cache[cache_key] = result
+        return result
+
+    def _apply_constraint_inner(idx, arg, meta_val, meta_stride_expr, stride_order):
         if not meta_val.is_cuda:
             return ir.ExternKernel.require_stride_order(arg, stride_order)
 
