@@ -221,6 +221,65 @@ class MemoryBoundedTests(TestCase):
         self.assertNotZero(calculate_runtime(f, *inp))
 
 
+class InputDistanceTests(TestCase):
+    device = DEVICE
+
+    def _get_snodes(self, f, *args):
+        metrics.reset()
+        torch._logging.set_logs(inductor_metrics=True)
+        torch.compile(f, backend=compile_but_use_eager)(*args)
+        torch._logging.set_logs()
+        return [snode for snode, _ in metrics.nodes_num_elem]
+
+    def test_chain_with_reduction(self):
+        """
+        input -> sum (depth 0) -> sum (depth 1)
+        Reductions prevent full fusion, giving us distinct depth levels.
+        """
+
+        def f(x):
+            a = x.sum(dim=-1)
+            return a.sum(dim=-1)
+
+        snodes = self._get_snodes(f, T(10, 10, 10))
+        all_min = [s.min_input_distance for s in snodes]
+        all_max = [s.max_input_distance for s in snodes]
+        self.assertEqual(min(all_min), 0)
+        self.assertEqual(max(all_max), 1)
+
+    def test_fused_node_depth_range(self):
+        """
+        A reduction fused with its pointwise epilogue should have
+        min_input_distance=0 and max_input_distance=1.
+        """
+
+        def f(x):
+            a = x.sum(dim=-1)
+            return a.cos()
+
+        snodes = self._get_snodes(f, T(10, 10))
+        # The reduction and pointwise get fused
+        self.assertEqual(len(snodes), 1)
+        self.assertEqual(snodes[0].min_input_distance, 0)
+        self.assertEqual(snodes[0].max_input_distance, 1)
+
+    def test_extern_kernel_chain(self):
+        """
+        mm (depth 0, extern) -> cos+sum fused (depth 1)
+        """
+
+        def f(a, b):
+            c = torch.mm(a, b)
+            d = c.cos()
+            return d.sum(dim=-1)
+
+        snodes = self._get_snodes(f, T(10, 10), T(10, 10))
+        all_min = [s.min_input_distance for s in snodes]
+        all_max = [s.max_input_distance for s in snodes]
+        self.assertEqual(min(all_min), 0)
+        self.assertEqual(max(all_max), 1)
+
+
 @skipIf(not dist.is_available(), "requires distributed")
 class TestCommAnalysis(TestCase):
     device = DEVICE
