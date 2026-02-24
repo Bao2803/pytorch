@@ -2592,6 +2592,38 @@ class TestMaxAutotune(TestCase):
 
         self.assertTrue(flexible_layout_called)
 
+    @config.patch(
+        {
+            "max_autotune": True,
+        }
+    )
+    def test_deferred_layout_constraint_autotuning_time(self):
+        batch, m, k, n = 4608, 40, 112, 1119
+
+        # Shape: batch x m x k (contiguous)
+        a = torch.randn(batch, m, k, dtype=torch.bfloat16, device=GPU_TYPE)
+
+        padded_batch_stride = k * n + 48
+        b = torch.empty_strided(
+            size=(batch, k, n),
+            stride=(padded_batch_stride, 1, k),
+            dtype=torch.bfloat16,
+            device=GPU_TYPE,
+        )
+        b.copy_(torch.randn_like(b))
+
+        def fn(a, b):
+            # Apply a pointwise op to b to make it FlexibleLayout in Inductor
+            # This ensures Inductor doesn't treat it as a fixed/external layout
+            # Ends up double padding
+            b_flex = b + 0
+            return torch.bmm(a, b_flex).to(torch.float32), b + 1.0
+
+        compiled_fn = torch.compile(fn)
+
+        # Previously would CUDA IMA
+        run_and_get_code(compiled_fn, a, b)
+
 
 @instantiate_parametrized_tests
 class TestTemplateConfigPruning(TestCase):
